@@ -38,30 +38,60 @@ import (
 func TestSidecarRun(t *testing.T) {
 	t.Parallel()
 
+	type expected struct {
+		state       v1alpha1.State
+		labels      map[string]string
+		annotations map[string]string
+		recordings  []string
+	}
+
 	fixtures := map[string]struct {
-		state      v1alpha1.State
-		f          func(*SDKServer, context.Context)
-		recordings []string
+		f        func(*SDKServer, context.Context)
+		expected expected
 	}{
 		"ready": {
-			state: v1alpha1.RequestReady,
 			f: func(sc *SDKServer, ctx context.Context) {
 				sc.Ready(ctx, &sdk.Empty{}) // nolint: errcheck
 			},
+			expected: expected{
+				state: v1alpha1.RequestReady,
+			},
 		},
 		"shutdown": {
-			state: v1alpha1.Shutdown,
 			f: func(sc *SDKServer, ctx context.Context) {
 				sc.Shutdown(ctx, &sdk.Empty{}) // nolint: errcheck
 			},
+			expected: expected{
+				state: v1alpha1.Shutdown,
+			},
 		},
 		"unhealthy": {
-			state: v1alpha1.Unhealthy,
 			f: func(sc *SDKServer, ctx context.Context) {
 				// we have a 1 second timeout
 				time.Sleep(2 * time.Second)
 			},
-			recordings: []string{string(v1alpha1.Unhealthy)},
+			expected: expected{
+				state:      v1alpha1.Unhealthy,
+				recordings: []string{string(v1alpha1.Unhealthy)},
+			},
+		},
+		"label": {
+			f: func(sc *SDKServer, ctx context.Context) {
+				_, err := sc.SetLabel(ctx, &sdk.KeyValue{Key: "foo", Value: "bar"})
+				assert.Nil(t, err)
+			},
+			expected: expected{
+				labels: map[string]string{metadataPrefix + "foo": "bar"},
+			},
+		},
+		"annotation": {
+			f: func(sc *SDKServer, ctx context.Context) {
+				_, err := sc.SetAnnotation(ctx, &sdk.KeyValue{Key: "test", Value: "annotation"})
+				assert.Nil(t, err)
+			},
+			expected: expected{
+				annotations: map[string]string{metadataPrefix + "test": "annotation"},
+			},
 		},
 	}
 
@@ -72,7 +102,9 @@ func TestSidecarRun(t *testing.T) {
 
 			m.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
 				gs := v1alpha1.GameServer{
-					ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test", Namespace: "default",
+					},
 					Spec: v1alpha1.GameServerSpec{
 						Health: v1alpha1.Health{Disabled: false, FailureThreshold: 1, PeriodSeconds: 1, InitialDelaySeconds: 0},
 					},
@@ -88,7 +120,16 @@ func TestSidecarRun(t *testing.T) {
 				ua := action.(k8stesting.UpdateAction)
 				gs := ua.GetObject().(*v1alpha1.GameServer)
 
-				assert.Equal(t, v.state, gs.Status.State)
+				if v.expected.state != "" {
+					assert.Equal(t, v.expected.state, gs.Status.State)
+				}
+
+				for label, value := range v.expected.labels {
+					assert.Equal(t, value, gs.ObjectMeta.Labels[label])
+				}
+				for ann, value := range v.expected.annotations {
+					assert.Equal(t, value, gs.ObjectMeta.Annotations[ann])
+				}
 
 				return true, gs, nil
 			})
@@ -116,12 +157,91 @@ func TestSidecarRun(t *testing.T) {
 			}
 
 			logrus.Info("attempting to find event recording")
-			for _, str := range v.recordings {
+			for _, str := range v.expected.recordings {
 				agtesting.AssertEventContains(t, m.FakeRecorder.Events, str)
 			}
 
 			cancel()
 			wg.Wait()
+		})
+	}
+}
+
+func TestSDKServerSyncGameServer(t *testing.T) {
+	t.Parallel()
+
+	type expected struct {
+		state       v1alpha1.State
+		labels      map[string]string
+		annotations map[string]string
+	}
+
+	fixtures := map[string]struct {
+		expected expected
+		key      string
+	}{
+		"ready": {
+			key: string(updateState) + "/" + string(v1alpha1.Ready),
+			expected: expected{
+				state: v1alpha1.Ready,
+			},
+		},
+		"label": {
+			key: string(updateLabel) + "/foo/bar",
+			expected: expected{
+				labels: map[string]string{metadataPrefix + "foo": "bar"},
+			},
+		},
+		"annotation": {
+			key: string(updateAnnotation) + "/test/annotation",
+			expected: expected{
+				annotations: map[string]string{metadataPrefix + "test": "annotation"},
+			},
+		},
+	}
+
+	for k, v := range fixtures {
+		t.Run(k, func(t *testing.T) {
+			m := agtesting.NewMocks()
+			sc, err := defaultSidecar(m)
+			assert.Nil(t, err)
+			updated := false
+
+			m.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				gs := v1alpha1.GameServer{ObjectMeta: metav1.ObjectMeta{
+					UID:  "1234",
+					Name: sc.gameServerName, Namespace: sc.namespace,
+					Labels: map[string]string{}, Annotations: map[string]string{}},
+				}
+				return true, &v1alpha1.GameServerList{Items: []v1alpha1.GameServer{gs}}, nil
+			})
+			m.AgonesClient.AddReactor("update", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				updated = true
+				ua := action.(k8stesting.UpdateAction)
+				gs := ua.GetObject().(*v1alpha1.GameServer)
+
+				if v.expected.state != "" {
+					assert.Equal(t, v.expected.state, gs.Status.State)
+				}
+				for label, value := range v.expected.labels {
+					assert.Equal(t, value, gs.ObjectMeta.Labels[label])
+				}
+				for ann, value := range v.expected.annotations {
+					assert.Equal(t, value, gs.ObjectMeta.Annotations[ann])
+				}
+
+				return true, gs, nil
+			})
+
+			stop := make(chan struct{})
+			defer close(stop)
+			sc.informerFactory.Start(stop)
+			assert.True(t, cache.WaitForCacheSync(stop, sc.gameServerSynced))
+
+			err = sc.syncGameServer(v.key)
+			assert.Nil(t, err)
+			assert.True(t, updated, "should have updated")
+
 		})
 	}
 }
@@ -357,73 +477,6 @@ func TestSidecarHTTPHealthCheck(t *testing.T) {
 	testHTTPHealth(t, "http://localhost:8080/gshealthz", "", http.StatusInternalServerError)
 	cancel()
 	wg.Wait() // wait for go routine test results.
-}
-
-func TestSDKServerConvert(t *testing.T) {
-	t.Parallel()
-
-	fixture := &v1alpha1.GameServer{
-		ObjectMeta: metav1.ObjectMeta{
-			CreationTimestamp: metav1.Now(),
-			Namespace:         "default",
-			Name:              "test",
-			Labels:            map[string]string{"foo": "bar"},
-			Annotations:       map[string]string{"stuff": "things"},
-			UID:               "1234",
-		},
-		Spec: v1alpha1.GameServerSpec{
-			Health: v1alpha1.Health{
-				Disabled:            false,
-				InitialDelaySeconds: 10,
-				FailureThreshold:    15,
-				PeriodSeconds:       20,
-			},
-		},
-		Status: v1alpha1.GameServerStatus{
-			NodeName: "george",
-			Address:  "127.0.0.1",
-			State:    "Ready",
-			Ports: []v1alpha1.GameServerStatusPort{
-				{Name: "default", Port: 12345},
-				{Name: "beacon", Port: 123123},
-			},
-		},
-	}
-
-	m := agtesting.NewMocks()
-	sc, err := defaultSidecar(m)
-	assert.Nil(t, err)
-
-	eq := func(t *testing.T, fixture *v1alpha1.GameServer, sdkGs *sdk.GameServer) {
-		assert.Equal(t, fixture.ObjectMeta.Name, sdkGs.ObjectMeta.Name)
-		assert.Equal(t, fixture.ObjectMeta.Namespace, sdkGs.ObjectMeta.Namespace)
-		assert.Equal(t, fixture.ObjectMeta.CreationTimestamp.Unix(), sdkGs.ObjectMeta.CreationTimestamp)
-		assert.Equal(t, string(fixture.ObjectMeta.UID), sdkGs.ObjectMeta.Uid)
-		assert.Equal(t, fixture.ObjectMeta.Labels, sdkGs.ObjectMeta.Labels)
-		assert.Equal(t, fixture.ObjectMeta.Annotations, sdkGs.ObjectMeta.Annotations)
-		assert.Equal(t, fixture.Spec.Health.Disabled, sdkGs.Spec.Health.Disabled)
-		assert.Equal(t, fixture.Spec.Health.InitialDelaySeconds, sdkGs.Spec.Health.InitialDelaySeconds)
-		assert.Equal(t, fixture.Spec.Health.FailureThreshold, sdkGs.Spec.Health.FailureThreshold)
-		assert.Equal(t, fixture.Spec.Health.PeriodSeconds, sdkGs.Spec.Health.PeriodSeconds)
-		assert.Equal(t, fixture.Status.Address, sdkGs.Status.Address)
-		assert.Equal(t, string(fixture.Status.State), sdkGs.Status.State)
-		assert.Len(t, sdkGs.Status.Ports, len(fixture.Status.Ports))
-		for i, fp := range fixture.Status.Ports {
-			p := sdkGs.Status.Ports[i]
-			assert.Equal(t, fp.Name, p.Name)
-			assert.Equal(t, fp.Port, p.Port)
-		}
-	}
-
-	sdkGs := sc.convert(fixture)
-	eq(t, fixture, sdkGs)
-	assert.Zero(t, sdkGs.ObjectMeta.DeletionTimestamp)
-
-	now := metav1.Now()
-	fixture.DeletionTimestamp = &now
-	sdkGs = sc.convert(fixture)
-	eq(t, fixture, sdkGs)
-	assert.Equal(t, fixture.ObjectMeta.DeletionTimestamp.Unix(), sdkGs.ObjectMeta.DeletionTimestamp)
 }
 
 func TestSDKServerGetGameServer(t *testing.T) {

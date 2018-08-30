@@ -62,6 +62,28 @@ Call when the GameServer session is over and it's time to shut down
 $ curl -d "{}" -H "Content-Type: application/json" -X POST http://localhost:59358/shutdown
 ```
 
+### Set Label
+
+Apply a Label with the prefix "stable.agones.dev/sdk-" to the backing `GameServer` metadata. 
+
+See the SDK [SetLabel](../sdks/README.md#setlabelkey-value) documentation for restrictions.
+
+#### Example
+
+```bash
+$ curl -d '{"key": "foo", "value": "bar"}' -H "Content-Type: application/json" -X PUT http://localhost:59358/metadata/label
+```
+
+### Set Annotation
+
+Apply a Annotation with the prefix "stable.agones.dev/sdk-" to the backing `GameServer` metadata
+
+#### Example
+
+```bash
+$ curl -d '{"key": "foo", "value": "bar"}' -H "Content-Type: application/json" -X PUT http://localhost:59358/metadata/annotation
+```
+
 ### GameServer
 
 Call when you want to retrieve the backing `GameServer` configuration details
@@ -105,7 +127,7 @@ Response:
 
 ### Watch GameServer
 
-⚠️⚠️⚠️ **/watch/gameserver is currently a development feature and has not been released** ⚠️⚠️⚠️
+⚠️⚠️⚠️ **/watch/gameserver is currently a release candidate feature** ⚠️⚠️⚠️
 
 Call this when you want to get updates of when the backing `GameServer` configuration is updated.
 
